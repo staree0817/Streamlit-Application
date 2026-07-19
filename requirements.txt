@@ -1,5 +1,12 @@
 streamlit
-yfinance
-plotly
 pandas
-openpyxl
+plotly
+requests
+matplotlib
+wordcloud
+transformers
+torch
+konlpy
+scikit-learn
+sentencepiece
+protobuf
