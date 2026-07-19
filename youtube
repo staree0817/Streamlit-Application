@@ -1,0 +1,664 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import requests
+import re
+from urllib.parse import urlparse, parse_qs
+from collections import Counter
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+
+from transformers import pipeline
+
+st.set_page_config(
+    page_title="YouTube 댓글 분석기",
+    page_icon="📊",
+    layout="wide"
+)
+
+st.title("📊 AI YouTube 댓글 분석기")
+st.caption("YouTube Data API를 이용하여 댓글을 분석합니다.")
+
+#############################
+# Sidebar
+#############################
+
+with st.sidebar:
+
+    st.header("설정")
+
+    API_KEY = st.text_input(
+        "YouTube API Key",
+        type="password"
+    )
+
+    VIDEO_URL = st.text_input(
+        "영상 URL"
+    )
+
+    MAX_RESULTS = st.slider(
+        "최대 댓글 수",
+        100,
+        1000,
+        500,
+        100
+    )
+
+    run = st.button("분석 시작")
+
+
+#############################
+# URL → Video ID
+#############################
+
+def extract_video_id(url):
+
+    if "youtu.be" in url:
+        return url.split("/")[-1].split("?")[0]
+
+    parsed = urlparse(url)
+
+    if parsed.hostname in [
+        "www.youtube.com",
+        "youtube.com"
+    ]:
+
+        return parse_qs(
+            parsed.query
+        ).get(
+            "v",
+            [None]
+        )[0]
+
+    return None
+
+
+#############################
+# 댓글 가져오기
+#############################
+
+def get_comments(api_key, video_id, limit):
+
+    comments = []
+
+    next_page = ""
+
+    progress = st.progress(0)
+
+    while len(comments) < limit:
+
+        url = (
+            "https://www.googleapis.com/youtube/v3/commentThreads"
+        )
+
+        params = {
+
+            "part":"snippet",
+
+            "videoId":video_id,
+
+            "maxResults":100,
+
+            "pageToken":next_page,
+
+            "key":api_key,
+
+            "textFormat":"plainText"
+
+        }
+
+        response = requests.get(
+            url,
+            params=params
+        ).json()
+
+        if "items" not in response:
+            break
+
+        for item in response["items"]:
+
+            s = item["snippet"]["topLevelComment"]["snippet"]
+
+            comments.append({
+
+                "작성자":s["authorDisplayName"],
+
+                "댓글":s["textDisplay"],
+
+                "좋아요":s["likeCount"],
+
+                "날짜":s["publishedAt"][:10]
+
+            })
+
+            if len(comments) >= limit:
+                break
+
+        progress.progress(
+            min(
+                len(comments)/limit,
+                1.0
+            )
+        )
+
+        next_page = response.get(
+            "nextPageToken"
+        )
+
+        if not next_page:
+            break
+
+    progress.empty()
+
+    return pd.DataFrame(comments)
+
+
+#############################
+# 실행
+#############################
+
+if run:
+
+    if not API_KEY:
+
+        st.error("API Key를 입력하세요.")
+
+        st.stop()
+
+    vid = extract_video_id(
+        VIDEO_URL
+    )
+
+    if vid is None:
+
+        st.error("올바른 URL이 아닙니다.")
+
+        st.stop()
+
+    with st.spinner("댓글을 가져오는 중..."):
+
+        df = get_comments(
+            API_KEY,
+            vid,
+            MAX_RESULTS
+        )
+
+    if len(df)==0:
+
+        st.warning("댓글을 가져오지 못했습니다.")
+
+        st.stop()
+
+    st.success(f"{len(df)}개의 댓글을 가져왔습니다.")
+
+    st.subheader("댓글 데이터")
+
+    st.dataframe(df,use_container_width=True)
+
+    csv = df.to_csv(index=False).encode("utf-8-sig")
+
+    st.download_button(
+        "CSV 다운로드",
+        csv,
+        "youtube_comments.csv",
+        "text/csv"
+    )
+
+    st.session_state["comments"] = df
+
+######################################################
+# 감성 분석 모델
+######################################################
+
+@st.cache_resource
+def load_sentiment_model():
+
+    classifier = pipeline(
+        "text-classification",
+        model="snunlp/KR-FinBert-SC"
+    )
+
+    return classifier
+
+
+######################################################
+# 감성 분석
+######################################################
+
+def analyze_sentiment(df):
+
+    classifier = load_sentiment_model()
+
+    sentiments = []
+    scores = []
+
+    progress = st.progress(0)
+
+    total = len(df)
+
+    for i, text in enumerate(df["댓글"]):
+
+        try:
+
+            result = classifier(
+                text[:512]
+            )[0]
+
+            label = result["label"]
+
+            score = result["score"]
+
+        except:
+
+            label = "중립"
+            score = 0
+
+        sentiments.append(label)
+        scores.append(score)
+
+        progress.progress((i+1)/total)
+
+    progress.empty()
+
+    df["감성"] = sentiments
+    df["신뢰도"] = scores
+
+    return df
+
+
+######################################################
+# 키워드 추출
+######################################################
+
+def extract_keywords(df):
+
+    text = " ".join(df["댓글"].astype(str))
+
+    words = re.findall(
+        r"[가-힣]{2,}",
+        text
+    )
+
+    stopwords = {
+
+        "정말","진짜","너무","그리고","입니다",
+        "영상","오늘","그냥","항상","감사",
+        "이번","이거","저는","제가","ㅋㅋ","ㅎㅎ",
+        "있어요","합니다","같아요","입니다",
+        "이렇게","하세요","입니다","진심"
+    }
+
+    words = [
+
+        w
+
+        for w in words
+
+        if w not in stopwords
+
+    ]
+
+    counter = Counter(words)
+
+    return counter.most_common(20)
+
+
+######################################################
+# 워드클라우드
+######################################################
+
+def draw_wordcloud(df):
+
+    text = " ".join(df["댓글"])
+
+    words = re.findall(
+        r"[가-힣]{2,}",
+        text
+    )
+
+    text = " ".join(words)
+
+    wc = WordCloud(
+
+        font_path="NanumGothic.ttf",
+
+        width=1200,
+
+        height=700,
+
+        background_color="white"
+
+    ).generate(text)
+
+    fig, ax = plt.subplots(figsize=(12,6))
+
+    ax.imshow(wc)
+
+    ax.axis("off")
+
+    st.pyplot(fig)
+
+
+######################################################
+# 분석 시작
+######################################################
+
+if "comments" in st.session_state:
+
+    st.divider()
+
+    st.header("AI 감성 분석")
+
+    with st.spinner("AI가 댓글을 분석하는 중..."):
+
+        df = analyze_sentiment(
+            st.session_state["comments"]
+        )
+
+    st.session_state["comments"] = df
+
+    sentiment_count = (
+
+        df["감성"]
+
+        .value_counts()
+
+        .reset_index()
+
+    )
+
+    sentiment_count.columns = [
+
+        "감성",
+
+        "개수"
+
+    ]
+
+    fig = px.pie(
+
+        sentiment_count,
+
+        values="개수",
+
+        names="감성",
+
+        title="감성 비율"
+
+    )
+
+    st.plotly_chart(
+
+        fig,
+
+        use_container_width=True
+
+    )
+
+######################################################
+# 키워드
+######################################################
+
+    st.subheader("TOP20 키워드")
+
+    keywords = extract_keywords(df)
+
+    keyword_df = pd.DataFrame(
+
+        keywords,
+
+        columns=[
+
+            "단어",
+
+            "빈도"
+
+        ]
+
+    )
+
+    st.dataframe(
+
+        keyword_df,
+
+        use_container_width=True
+
+    )
+
+######################################################
+# 워드클라우드
+######################################################
+
+    st.subheader("워드클라우드")
+
+    draw_wordcloud(df)
+
+######################################################
+# 날짜 형식 변환
+######################################################
+
+df = st.session_state["comments"]
+
+df["날짜"] = pd.to_datetime(df["날짜"])
+
+######################################################
+# 날짜별 댓글 수
+######################################################
+
+st.divider()
+
+st.header("📅 날짜별 댓글 추이")
+
+daily = (
+    df.groupby("날짜")
+      .size()
+      .reset_index(name="댓글 수")
+)
+
+fig = px.line(
+    daily,
+    x="날짜",
+    y="댓글 수",
+    markers=True,
+    title="날짜별 댓글 작성 수"
+)
+
+st.plotly_chart(
+    fig,
+    use_container_width=True
+)
+
+######################################################
+# 좋아요 TOP10
+######################################################
+
+st.divider()
+
+st.header("❤️ 좋아요 TOP10 댓글")
+
+top10 = (
+
+    df
+
+    .sort_values(
+        "좋아요",
+        ascending=False
+    )
+
+    .head(10)
+
+)
+
+st.dataframe(
+    top10[
+        [
+            "좋아요",
+            "작성자",
+            "댓글"
+        ]
+    ],
+    use_container_width=True
+)
+
+######################################################
+# 댓글 길이
+######################################################
+
+st.divider()
+
+st.header("✍️ 댓글 길이 분석")
+
+df["길이"] = df["댓글"].str.len()
+
+fig = px.histogram(
+
+    df,
+
+    x="길이",
+
+    nbins=30,
+
+    title="댓글 길이 분포"
+
+)
+
+st.plotly_chart(
+
+    fig,
+
+    use_container_width=True
+
+)
+
+######################################################
+# 키워드 막대그래프
+######################################################
+
+st.divider()
+
+st.header("🔥 TOP20 키워드")
+
+keyword_df = keyword_df.sort_values(
+    "빈도",
+    ascending=False
+)
+
+fig = px.bar(
+
+    keyword_df,
+
+    x="단어",
+
+    y="빈도",
+
+    text="빈도"
+
+)
+
+st.plotly_chart(
+
+    fig,
+
+    use_container_width=True
+
+)
+
+######################################################
+# 감성별 개수
+######################################################
+
+st.divider()
+
+st.header("😊 감성 통계")
+
+col1, col2, col3 = st.columns(3)
+
+positive = len(
+    df[df["감성"]=="positive"]
+)
+
+negative = len(
+    df[df["감성"]=="negative"]
+)
+
+neutral = len(df) - positive - negative
+
+col1.metric(
+    "😊 긍정",
+    positive
+)
+
+col2.metric(
+    "😐 중립",
+    neutral
+)
+
+col3.metric(
+    "😡 부정",
+    negative
+)
+
+######################################################
+# 감성별 댓글 보기
+######################################################
+
+st.divider()
+
+st.header("💬 감성별 댓글")
+
+choice = st.selectbox(
+
+    "감성 선택",
+
+    [
+
+        "전체",
+
+        "positive",
+
+        "negative",
+
+        "중립"
+
+    ]
+
+)
+
+if choice != "전체":
+
+    show = df[
+        df["감성"]==choice
+    ]
+
+else:
+
+    show = df
+
+st.dataframe(
+
+    show,
+
+    use_container_width=True
+
+)
+
+######################################################
+# 결과 다운로드
+######################################################
+
+csv = df.to_csv(
+    index=False
+).encode("utf-8-sig")
+
+st.download_button(
+
+    "📥 분석 결과 다운로드",
+
+    csv,
+
+    "youtube_comment_analysis.csv",
+
+    "text/csv"
+
+)
+
